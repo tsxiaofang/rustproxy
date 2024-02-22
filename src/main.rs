@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::{env, error, fmt, fs::File, io, io::BufRead, io::BufReader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 
@@ -60,12 +59,27 @@ lazy_static! {
             }
         }
 
+        if let Ok(json_str) = std::fs::read_to_string("hosts.json") {
+            if let Ok(hosts) = serde_json::from_str::<Vec<Vec<String>>>(&json_str) {
+                for item in hosts {
+                    if item.len() >= 2 {
+                        let val = item[0].trim();
+                        let key = item[1].trim();
+                        m.insert(key.into(), val.into());
+                    }
+                }
+            }
+        }
+
         m
     };
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    for (k, v) in SVR_ADDR_MAP.iter() {
+        println!("key:{}, val:{}", k, v);
+    }
     let mut bind_addr = String::from("0.0.0.0:1080");
     let mut target_addr = String::from("proxy");
 
@@ -165,6 +179,12 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
 
         if let Some(val) = SVR_ADDR_MAP.get(&result) {
             result = val.clone();
+        } else {
+            if let Some((l, r)) = result.split_once(':') {
+                if let Some(val) = SVR_ADDR_MAP.get(l) {
+                    result = format!("{}:{}", val, r);
+                }
+            }
         }
 
         println!("proxy connect {}", result);
@@ -191,11 +211,11 @@ async fn process_client_handler(mut s_client: TcpStream, target_addr: String) ->
     let mut t_text = "target unreachable";
 
     if let Ok(s_server) = s_conn {
-        let (s_rx, s_tx) = s_server.into_split();
-        let (c_rx, c_tx) = s_client.into_split();
+        let (mut s_rx, mut s_tx) = s_server.into_split();
+        let (mut c_rx, mut c_tx) = s_client.into_split();
 
-        let f1 = transfer_data(s_rx, c_tx);
-        let f2 = transfer_data(c_rx, s_tx);
+        let f1 = tokio::io::copy(&mut s_rx, &mut c_tx);
+        let f2 = tokio::io::copy(&mut c_rx, &mut s_tx);
 
         //tokio::try_join!(f1, f2)?;
         tokio::select! {
@@ -210,22 +230,6 @@ async fn process_client_handler(mut s_client: TcpStream, target_addr: String) ->
 
     if let Ok(addr) = c_addr {
         println!("{} connection {}.", t_text, addr.to_string());
-    }
-
-    Ok(())
-}
-
-async fn transfer_data(mut c: OwnedReadHalf, mut s: OwnedWriteHalf) -> io::Result<()> {
-    let mut buf = [0u8; 4096];
-
-    while let Ok(nread) = c.read(&mut buf).await {
-        if nread == 0 {
-            break;
-        }
-
-        if let Err(_) = s.write_all(&buf[0..nread]).await {
-            break;
-        }
     }
 
     Ok(())
