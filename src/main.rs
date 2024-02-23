@@ -45,20 +45,22 @@ lazy_static! {
     static ref SVR_ADDR_MAP: HashMap<String, String> = {
         let mut m = HashMap::new();
 
+        // file content format
+        // key=val\n
         if let Ok(f) = File::open("map.txt") {
             let reader = BufReader::new(f);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    let vs: Vec<&str> = l.split("=").collect();
-                    if vs.len() >= 2 {
-                        let key = vs[0].trim();
-                        let val = vs[1].trim();
-                        m.insert(key.into(), val.into());
-                    }
+            for line in reader.lines().map_while(|v| v.ok()) {
+                let vs: Vec<&str> = line.split('=').collect();
+                if vs.len() >= 2 {
+                    let key = vs[0].trim();
+                    let val = vs[1].trim();
+                    m.insert(key.into(), val.into());
                 }
             }
         }
 
+        // file content format
+        // [["ip", "domain"],["ip", "domain"]]
         if let Ok(json_str) = std::fs::read_to_string("hosts.json") {
             if let Ok(hosts) = serde_json::from_str::<Vec<Vec<String>>>(&json_str) {
                 for item in hosts {
@@ -102,7 +104,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
     while let Ok((socket, accept_addr)) = listener.accept().await {
-        println!("clinet {} connected.", accept_addr.to_string());
+        println!("clinet {} connected.", accept_addr);
 
         let target = target_addr.clone();
 
@@ -122,7 +124,7 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
 
     if result == "proxy" {
         let nread1 = fd.read(&mut buf).await?;
-        if nread1 <= 0 {
+        if nread1 == 0 {
             return Err(AddressError::ConnectClosed("connect closed."));
         }
 
@@ -130,13 +132,13 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
 
         let nread2 = (&buf[..]).read_line(&mut http_cmd)?;
 
-        if nread2 <= 0 {
+        if nread2 == 0 {
             return Err(AddressError::EmptyCommand("empty command."));
         }
 
         println!("{http_cmd}");
 
-        let v: Vec<&str> = http_cmd.split(" ").collect();
+        let v: Vec<&str> = http_cmd.split(' ').collect();
         if v.len() < 3 {
             return Err(AddressError::UnknownFormat("unknown format."));
         }
@@ -150,13 +152,13 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
                 if let Some(n) = v[1].find("//") {
                     let (_, r) = v[1].split_at(n + 2);
 
-                    if let Some(n) = r.find("/") {
+                    if let Some(n) = r.find('/') {
                         let (l, r) = r.split_at(n);
                         b_flag = 2;
 
                         url.push_str("GET ");
                         url.push_str(r);
-                        url.push_str(" ");
+                        url.push(' ');
                         url.push_str(v[2]);
                         url.push_str(&String::from_utf8_lossy(&buf[nread2..nread1]));
 
@@ -173,17 +175,15 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
             return Err(AddressError::UnknownCommand("unknown command."));
         }
 
-        if !result.contains(":") {
+        if !result.contains(':') {
             result.push_str(":80");
         }
 
         if let Some(val) = SVR_ADDR_MAP.get(&result) {
             result = val.clone();
-        } else {
-            if let Some((l, r)) = result.split_once(':') {
-                if let Some(val) = SVR_ADDR_MAP.get(l) {
-                    result = format!("{}:{}", val, r);
-                }
+        } else if let Some((l, r)) = result.split_once(':') {
+            if let Some(val) = SVR_ADDR_MAP.get(l) {
+                result = format!("{}:{}", val, r);
             }
         }
 
@@ -229,7 +229,7 @@ async fn process_client_handler(mut s_client: TcpStream, target_addr: String) ->
     }
 
     if let Ok(addr) = c_addr {
-        println!("{} connection {}.", t_text, addr.to_string());
+        println!("{} connection {}.", t_text, addr);
     }
 
     Ok(())
