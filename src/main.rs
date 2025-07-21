@@ -1,5 +1,7 @@
 use lazy_static::lazy_static;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::{env, error, fmt, fs::File, io, io::BufRead, io::BufReader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -83,6 +85,7 @@ async fn main() -> Result<()> {
     }
     let mut bind_addr = String::from("0.0.0.0:1080");
     let mut target_addr = String::from("proxy");
+    let mut socks_addr = String::default();
 
     for mut arg in env::args() {
         let v = arg.to_lowercase();
@@ -91,23 +94,28 @@ async fn main() -> Result<()> {
             bind_addr = arg.split_off(3);
         } else if v.starts_with("-t=") {
             target_addr = arg.split_off(3);
+        } else if v.starts_with("-pos=") {
+            socks_addr = arg.split_off(5);
         }
     }
 
-    println!("rustproxy -b={bind_addr} -t={target_addr}");
+    println!("rustproxy -b={bind_addr} -t={target_addr} -pos={socks_addr}");
 
     if bind_addr.is_empty() || target_addr.is_empty() {
         return Ok(()); //Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
 
+    let socks_proxy = Arc::new(socks_addr);
+    let target_addr = Arc::new(target_addr);
     let listener = TcpListener::bind(bind_addr).await?;
 
     while let Ok((socket, accept_addr)) = listener.accept().await {
         println!("clinet {accept_addr} connected.");
 
         let target = target_addr.clone();
+        let socks = socks_proxy.clone();
 
-        task::spawn(process_client_handler(socket, target));
+        task::spawn(process_client_handler(socket, target, socks));
     }
 
     Ok(())
@@ -115,18 +123,17 @@ async fn main() -> Result<()> {
 
 //GET http://127.0.0.1:8081/artifactory/api/conan/conan-vrv/v1/ping HTTP/1.1
 
-async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpStream> {
-    let mut result = target_addr;
+async fn connect_target(
+    fd: &mut TcpStream,
+    target_addr: &str,
+    socks_proxy: &str,
+) -> Result<TcpStream> {
+    let mut result = Cow::Borrowed(target_addr);
     let mut buf = [0u8; 4096];
     let mut b_flag = 0;
     let mut url = String::new();
-    let mut socks_proxy = Default::default();
 
-    if result == "proxy" || result.starts_with("socks") {
-        if result.len() > 6 {
-            socks_proxy = result.split_off(6);
-        }
-
+    if result.eq_ignore_ascii_case("proxy") {
         let nread1 = fd.read(&mut buf).await?;
         if nread1 == 0 {
             return Err(AddressError::ConnectClosed("connect closed."));
@@ -150,7 +157,7 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
         match v[0].trim().to_uppercase().as_str() {
             "CONNECT" => {
                 b_flag = 1;
-                result = v[1].to_string();
+                result = Cow::Owned(v[1].to_string());
             }
             "GET" => {
                 if let Some(n) = v[1].find("//") {
@@ -166,7 +173,7 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
                         url.push_str(v[2]);
                         url.push_str(&String::from_utf8_lossy(&buf[nread2..nread1]));
 
-                        result = l.to_string();
+                        result = Cow::Owned(l.to_string());
                     }
                 }
             }
@@ -180,14 +187,14 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
         }
 
         if !result.contains(':') {
-            result.push_str(":80");
+            result = Cow::Owned(format!("{result}:80"));
         }
 
-        if let Some(val) = SVR_ADDR_MAP.get(&result) {
-            result = val.clone();
+        if let Some(val) = SVR_ADDR_MAP.get(result.as_ref()) {
+            result = Cow::Borrowed(val);
         } else if let Some((l, r)) = result.split_once(':') {
             if let Some(val) = SVR_ADDR_MAP.get(l) {
-                result = format!("{val}:{r}");
+                result = Cow::Owned(format!("{val}:{r}"));
             }
         }
 
@@ -200,15 +207,14 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
 
     match socks_proxy.is_empty() {
         true => {
-            let mut s_conn = TcpStream::connect(result).await?;
+            let mut s_conn = TcpStream::connect(result.as_ref()).await?;
             if b_flag == 2 && !url.is_empty() {
                 s_conn.write_all(url.as_bytes()).await?;
             }
-
             Ok(s_conn)
         }
         false => {
-            let s = Socks5Stream::connect(socks_proxy.as_str(), result)
+            let s = Socks5Stream::connect(socks_proxy, result.as_ref())
                 .await
                 .map_err(|_| AddressError::CommError("connect proxy socks error."))?;
             Ok(s.into_inner())
@@ -216,10 +222,14 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
     }
 }
 
-async fn process_client_handler(mut s_client: TcpStream, target_addr: String) -> Result<()> {
+async fn process_client_handler(
+    mut s_client: TcpStream,
+    target_addr: Arc<String>,
+    socks_proxy: Arc<String>,
+) -> Result<()> {
     let c_addr = s_client.peer_addr();
 
-    let s_conn = connect_target(&mut s_client, target_addr).await;
+    let s_conn = connect_target(&mut s_client, &target_addr, &socks_proxy).await;
 
     let mut t_text = "target unreachable";
 
