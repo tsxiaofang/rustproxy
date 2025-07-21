@@ -1,11 +1,10 @@
+use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::{env, error, fmt, fs::File, io, io::BufRead, io::BufReader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
-
-#[macro_use]
-extern crate lazy_static;
+use tokio_socks::tcp::Socks5Stream;
 
 #[allow(unused)]
 #[derive(Debug)]
@@ -21,12 +20,12 @@ enum AddressError {
 impl fmt::Display for AddressError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CommError(v) => write!(f, "{}", v),
-            Self::ConnectClosed(v) => write!(f, "{}", v),
-            Self::EmptyCommand(v) => write!(f, "{}", v),
-            Self::UnknownCommand(v) => write!(f, "{}", v),
-            Self::UnknownFormat(v) => write!(f, "{}", v),
-            Self::IoError(v) => write!(f, "{}", v),
+            Self::CommError(v) => write!(f, "{v}"),
+            Self::ConnectClosed(v) => write!(f, "{v}"),
+            Self::EmptyCommand(v) => write!(f, "{v}"),
+            Self::UnknownCommand(v) => write!(f, "{v}"),
+            Self::UnknownFormat(v) => write!(f, "{v}"),
+            Self::IoError(v) => write!(f, "{v}"),
         }
     }
 }
@@ -80,7 +79,7 @@ lazy_static! {
 #[tokio::main]
 async fn main() -> Result<()> {
     for (k, v) in SVR_ADDR_MAP.iter() {
-        println!("key:{}, val:{}", k, v);
+        println!("key:{k}, val:{v}");
     }
     let mut bind_addr = String::from("0.0.0.0:1080");
     let mut target_addr = String::from("proxy");
@@ -95,7 +94,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("rustproxy -b={} -t={}", bind_addr, target_addr);
+    println!("rustproxy -b={bind_addr} -t={target_addr}");
 
     if bind_addr.is_empty() || target_addr.is_empty() {
         return Ok(()); //Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -104,7 +103,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
     while let Ok((socket, accept_addr)) = listener.accept().await {
-        println!("clinet {} connected.", accept_addr);
+        println!("clinet {accept_addr} connected.");
 
         let target = target_addr.clone();
 
@@ -121,8 +120,13 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
     let mut buf = [0u8; 4096];
     let mut b_flag = 0;
     let mut url = String::new();
+    let mut socks_proxy = Default::default();
 
-    if result == "proxy" {
+    if result == "proxy" || result.starts_with("socks") {
+        if result.len() > 6 {
+            socks_proxy = result.split_off(6);
+        }
+
         let nread1 = fd.read(&mut buf).await?;
         if nread1 == 0 {
             return Err(AddressError::ConnectClosed("connect closed."));
@@ -183,24 +187,33 @@ async fn connect_target(fd: &mut TcpStream, target_addr: String) -> Result<TcpSt
             result = val.clone();
         } else if let Some((l, r)) = result.split_once(':') {
             if let Some(val) = SVR_ADDR_MAP.get(l) {
-                result = format!("{}:{}", val, r);
+                result = format!("{val}:{r}");
             }
         }
 
-        println!("proxy connect {}", result);
+        println!("proxy connect {result}");
 
         if b_flag == 1 {
             fd.write_all(b"HTTP/1.1 200 Connection established\r\nHost: Rust Proxy\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n").await?;
         }
     }
 
-    let mut s_conn = TcpStream::connect(result).await?;
+    match socks_proxy.is_empty() {
+        true => {
+            let mut s_conn = TcpStream::connect(result).await?;
+            if b_flag == 2 && !url.is_empty() {
+                s_conn.write_all(url.as_bytes()).await?;
+            }
 
-    if b_flag == 2 && !url.is_empty() {
-        s_conn.write_all(url.as_bytes()).await?;
+            Ok(s_conn)
+        }
+        false => {
+            let s = Socks5Stream::connect(socks_proxy.as_str(), result)
+                .await
+                .map_err(|_| AddressError::CommError("connect proxy socks error."))?;
+            Ok(s.into_inner())
+        }
     }
-
-    Ok(s_conn)
 }
 
 async fn process_client_handler(mut s_client: TcpStream, target_addr: String) -> Result<()> {
@@ -229,7 +242,7 @@ async fn process_client_handler(mut s_client: TcpStream, target_addr: String) ->
     }
 
     if let Ok(addr) = c_addr {
-        println!("{} connection {}.", t_text, addr);
+        println!("{t_text} connection {addr}.");
     }
 
     Ok(())
